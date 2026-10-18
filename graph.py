@@ -219,4 +219,4 @@ builder.add_conditional_edges(
 builder.add_edge("tools", "assistant")
 
 memory = MemorySaver()
-graph = builder.compile(memory_saver=memory)
+graph = builder.compile(checkpointer=memory)
