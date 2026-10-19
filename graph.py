@@ -1,5 +1,6 @@
 import os
 import psycopg2
+import random
 from dotenv import load_dotenv
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
@@ -11,9 +12,12 @@ from langgraph.checkpoint.memory import MemorySaver
 # loading environment variables from .env file
 load_dotenv()
 
+current_investorID = random.randint(1, 20)
+
 # DB connection 
 def get_connection():
-    return psycopg2.connect(
+    # 1. Save the connection to a variable first
+    connection = psycopg2.connect(
         dbname=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
@@ -21,7 +25,21 @@ def get_connection():
         port=os.getenv("DB_PORT"),
     )
 
-llm = ChatOpenAI(model="gpt-4o")
+    connection.autocommit = True 
+
+    # 2. Set the RLS variable (using 'app.' to match your policy)
+    cursor = connection.cursor()
+    cursor.execute("SELECT set_config('app.current_investorID', %s, false);", (str(current_investorID),))
+    cursor.close()
+    
+    # 3. Now return the connection
+    return connection
+
+
+llm = ChatOpenAI(
+     model="gpt-5.6-luna",
+     reasoning_effort="none"
+    )
 
 # tools
 @tool
@@ -93,23 +111,28 @@ def sql_db_schema(table_names: str) -> str:
         connection.close()
 
 @tool
+
 def sql_db_query(query: str) -> str:
     """Input to this tool is a detailed and correct SQL query, output is a result from the database.
     If the query is not correct, an error message will be returned.
     If an error is returned, rewrite the query, check the query, and try again.
     If you encounter an issue with 'column "xxxx" does not exist', use sql_db_schema to query the correct table fields."""
     connection = get_connection()
+
     try:
-        connection.set_session(readonly=True)  # blocks writes
+        #connection.set_session(readonly=True)  # blocks writes
+
         cursor = connection.cursor()
         cursor.execute(query)
         res = cursor.fetchall()
         return str(res)
+    
     except Exception as e:
         return f"Error: {e}"
+
     finally:
         connection.close()
-        
+
 
 @tool
 def sql_db_query_checker(query: str) -> str:
@@ -172,7 +195,9 @@ Rules:
 - Do NOT make investment recommendations or tell the user what to buy, sell, or hold. You may describe the data, compare funds factually, and note how a fund's risk level relates to an investor's stated risk profile.
 - When giving commentary, keep it neutral and tie it to the data you retrieved.
 - Only share data for the investor being asked about. Don't expose other investors' information.
-- Keep answers clear and concise.""")
+- Keep answers clear and concise.
+- Do NOT ask the user for their investor ID. The database automatically restricts all data to the current logged-in investor via Row-Level Security. 
+""")
 
 
 def assistant(state: MessagesState):
@@ -195,7 +220,7 @@ Draft answer:
 \"\"\"{last.content}\"\"\""""
     result = llm.invoke(prompt).content.strip()
     if result.upper().startswith("PASS"):
-        return {"messages": [last]}
+        return {}
     return {"messages": [HumanMessage(content=f"[Reviewer] {result} Rewrite using only the retrieved data.")]}
 
 
