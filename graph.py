@@ -38,7 +38,7 @@ def get_connection():
 
 llm = ChatOpenAI(
      model="gpt-5.6-luna",
-     reasoning_effort="none"
+     reasoning_effort="none",
     )
 
 # tools
@@ -120,8 +120,6 @@ def sql_db_query(query: str) -> str:
     connection = get_connection()
 
     try:
-        #connection.set_session(readonly=True)  # blocks writes
-
         cursor = connection.cursor()
         cursor.execute(query)
         res = cursor.fetchall()
@@ -185,6 +183,7 @@ Database tables:
 
 How to query:
 - For any database question, call sql_db_list_tables first, then sql_db_schema for the relevant tables, before writing a query.
+- then, ALWAYS call sql_db_query_checker on your drafted query before executing it with sql_db_query.
 - Write PostgreSQL syntax. Use double quotes for mixed-case table or column names.
 - Only run read-only SELECT queries. Never use INSERT, UPDATE, DELETE, DROP, or ALTER.
 - Limit results to 10 rows unless asked otherwise.
