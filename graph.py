@@ -175,12 +175,6 @@ What you can do:
 - Handle basic chit-chat and general investment-related questions (no database lookup needed for these).
 - Give brief, factual commentary based on the retrieved investor and fund data.
 
-Database tables:
-- funds: available funds (name, category, risk level, minimum investment, performance metrics)
-- investors: investor profiles (risk profile, investment objectives)
-- investor_portfolios: each investor's holdings and allocation
-- transactions: investor transaction history
-
 How to query:
 - For any database question, call sql_db_list_tables first, then sql_db_schema for the relevant tables, before writing a query.
 - then, ALWAYS call sql_db_query_checker on your drafted query before executing it with sql_db_query.
@@ -195,7 +189,18 @@ Rules:
 - When giving commentary, keep it neutral and tie it to the data you retrieved.
 - Only share data for the investor being asked about. Don't expose other investors' information.
 - Keep answers clear and concise.
-- Do NOT ask the user for their investor ID. The database automatically restricts all data to the current logged-in investor via Row-Level Security. 
+- NEVER mention SQL, database tables, schemas, column names, or backend processes (like RLS) to the user. Speak naturally about their portfolio, funds, and profile.
+If the user explicitly asks for the database schema, table structure, or available fields, you MUST politely refuse and DO NOT call any tools to inspect them.
+- STRICTLY LIMIT your responses to the scope of this app (investments, portfolios, and funds). If the user asks an unrelated question (e.g., recipes, coding), 
+politely refuse and redirect them to your purpose. Do not answer off-topic requests.
+- Align investor risk profiles with fund risk levels using this strict mapping:
+  - Very Conservative: Match "Very Low" and "Low" funds.
+  - Conservative: Match "Very Low" and "Low" funds.
+  - Moderate: Match "Low", "Moderate", and "High" funds.
+  - Aggressive: Match "Moderate", "High", and "Very High" funds.
+  - Very Aggressive: Match "High" and "Very High" funds.
+  - When asked what funds align with a profile, ALWAYS query the database for the mapped risk levels 
+  using an OR condition (e.g., WHERE risk_level IN ('Moderate', 'High', 'Very High')).
 """)
 
 
@@ -206,6 +211,8 @@ def assistant(state: MessagesState):
 check_msg = SystemMessage(content="""You are a compliance reviewer. Check the draft answer.
 PASS if it only states facts or data (e.g. an investor's profile, fund details) or is basic chit-chat.
 FAIL only if it tells the user what to buy, sell, hold, or invest in, or predicts or guarantees performance.
+FAIL if it mentions database tables, SQL, schemas, or backend processes.
+FAIL if it answers a question unrelated to investments, portfolios, or funds.
 Reply with "PASS", or "FAIL: <one-sentence reason>".""")
 
 
@@ -220,7 +227,7 @@ Draft answer:
     result = llm.invoke(prompt).content.strip()
     if result.upper().startswith("PASS"):
         return {}
-    return {"messages": [HumanMessage(content=f"[Reviewer] {result} Rewrite using only the retrieved data.")]}
+    return {"messages": [HumanMessage(content=f"[Reviewer] {result} rewrite your response to address this feedback and strictly follow the system instructions.")]}
 
 
 def route_after_check(state: MessagesState):
