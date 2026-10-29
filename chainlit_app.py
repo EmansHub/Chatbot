@@ -11,7 +11,7 @@ async def start():
 
     cl.user_session.set("thread_id", str(uuid.uuid4()))
     
-    await cl.Message(content=f"Hi investor {current_id}, how can I help you today?").send()
+    await cl.Message(content=f"Hi investor {current_id}, how can I help you today?     مرحبا، كيف ممكن اساعدك؟").send()
 
 
 @cl.on_message
