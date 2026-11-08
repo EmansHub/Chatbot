@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "investment_chatbot": "./graph.py:studio_graph"
+  },
+  "env": "./.env"
+}
