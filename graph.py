@@ -4,7 +4,7 @@ import random
 import re
 from dotenv import load_dotenv
 from langchain.tools import tool
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 # from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage, RemoveMessage, ToolMessage, AIMessage 
 from langgraph.graph import START, END, StateGraph, MessagesState
@@ -229,7 +229,69 @@ SQL Query: """.format(query=query)
     return response.content.strip()
 
 
-tools = [sql_db_list_tables, sql_db_schema, sql_db_query_paged, sql_db_next_page, sql_db_query_checker] 
+kb_embedder = OpenAIEmbeddings(model="text-embedding-3-small")
+KB_CUTOFF = 0.60   # a chunk farther than this counts as "not relevant"
+KB_TOP_K = 3       # how many chunks to look at
+KB_TOOL = "search_knowledge_base"
+KB_NO_INFO = "I don't have information on that."
+KB_ERROR = "Sorry, I couldn't look that up right now. Please try again."
+
+
+def retrieve_passages(question: str) -> list[str]:
+    """Search the knowledge base. Returns the chunks closer than KB_CUTOFF, best first."""
+    vector = kb_embedder.embed_query(question)
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """SELECT content, embedding <=> %s::vector AS distance
+               FROM knowledge_base.chunks
+               ORDER BY distance
+               LIMIT %s""",
+            (str(vector), KB_TOP_K),
+        )
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return [content for content, distance in rows if distance <= KB_CUTOFF]
+
+KB_ANSWER_PROMPT = """You answer a general investment question using ONLY the passages below.
+- Use only facts written in the passages. Do not add definitions, examples, reasons or background, even if you are sure they are true.
+- Answer only if the passages directly answer the question. A passage that mentions the same topic or related words, but does not explain what was asked, is not an answer.
+- If the passages do not directly answer the question, reply with only this sentence: "I don't have information on that."
+- Do not state comparisons or conclusions (for example that two things are the same or different) unless a passage says so.
+- Never write phrases like "according to the passages" or "the provided information".
+- Keep the answer to at most 3 short sentences.
+
+Passages:
+{passages}"""
+
+
+def kb_answer(question: str) -> str:
+    """Search, then write the answer from the found passages only. Used by the tool and by the node."""
+    try:
+        passages = retrieve_passages(question)
+        if not passages:
+            return KB_NO_INFO                        # nothing close enough: no model call needed
+        return llm.invoke([
+            SystemMessage(content=KB_ANSWER_PROMPT.format(passages="\n\n---\n\n".join(passages))),
+            HumanMessage(content=question),
+        ]).content.strip()
+    except Exception:
+        return KB_ERROR
+
+@tool
+def search_knowledge_base(question: str) -> str:
+    """Use for meaning questions: what a term or concept means, how it works, or why it matters
+    (for example: what is a mutual fund, how does diversification work, why do people invest).
+    Do NOT use for stored values about the investor or about funds
+    (for example: my risk profile, the risk level of a named fund, which funds I hold).
+    Input: the question as a complete, standalone sentence. If the user's message is a follow-up
+    (for example "I still don't get it"), rewrite it using the conversation first.
+    Output: the final answer to that question. Use it exactly as written."""
+    return kb_answer(question)
+
+tools = [sql_db_list_tables, sql_db_schema, sql_db_query_paged, sql_db_next_page, sql_db_query_checker, search_knowledge_base] 
 
 # Define LLM with bound tools
 llm_with_tools = llm.bind_tools(tools)
@@ -282,11 +344,39 @@ sys_msg = SystemMessage(content="""
 # Role
 You are an investment information assistant backed by a PostgreSQL database containing investor profiles and fund data. All rules below apply together.
 
+# Meaning questions (search_knowledge_base)
+Classify every question as a meaning question or a data question, then follow the rule for that kind.
+
+Meaning question: asks for general knowledge: what something is, how it works, or why it matters. It is not about the investor's own data or about specific funds on the platform. Examples:
+- "what is a mutual fund?"
+- "how does diversification work?"
+- "why do people invest?"
+- "what does risk level mean?"
+
+Data question: asks for stored values about the investor, or about funds or categories on the platform. Examples:
+- "what is my risk profile?"
+- "which funds do I hold?"
+- "show me the Sukuk funds"
+- "what is the minimum investment of <fund name>?"
+
+The same word can appear in both kinds. The question decides, not the word:
+- "what is a Sukuk?" is a meaning question. "show me the Sukuk funds" is a data question.
+- "what does risk level mean?" is a meaning question. "what is the risk level of <fund name>?" is a data question.
+- "what is a money market fund?" is a meaning question. "which money market funds are available?" is a data question.
+These examples only show the pattern. Apply the same logic to any other term or topic, including ones not listed here.
+
+# Rules:
+- Meaning question: call search_knowledge_base with the question written as a complete standalone sentence. For several meaning questions in one message, call it once per question. If the user's message is a follow-up (for example "I still don't get it" or "what about ETFs?"), rewrite it using the conversation first (for example "what is a mutual fund?"). Do not use the database tools for it, even if the term is also a stored field or a category name. Never answer it from your own knowledge.
+- Data question: use the database tools as described in "How to query". Do not call search_knowledge_base for it.
+- A message with both kinds of question: use both, in any order, until you have what you need.
+- The result of search_knowledge_base is final. Use it exactly as written for the meaning part: do not rephrase it, shorten it, or add anything to it. If the result is "I don't have information on that.", say exactly that for that part.
+
 # What you can do
+- Stored values for the investor or a named fund (for example, a fund's historical return) still come from the database.
 - Answer investor questions using SQL-based retrieval: risk profile, portfolio holdings, allocation, and investment objectives.
 - Retrieve available funds with their risk levels, categories, and key performance metrics.
 - Give brief, factual commentary based on the retrieved investor and fund data.
-- Handle basic chit-chat and general investment education (concepts and terms) directly, with no database lookup.
+- Handle basic chit-chat directly, with no tool call.
 Anything about the investor, or about specific funds or fund categories on the platform, is a database question, never a general-knowledge one.
 
 # How to query
@@ -341,6 +431,7 @@ When asked which funds align with a profile, ALWAYS query the database for the m
 - NEVER mention SQL, database tables, schemas, column names, or backend processes (like RLS) to the user. Speak naturally about their portfolio, funds, and profile.
 - If the user explicitly asks for the database schema, table structure, or available fields, you MUST politely refuse and DO NOT call any tools to inspect them.
 - Do not give any id number. Use the fund name or a descriptive phrase. If the user asks for a fund by number, politely refuse and ask for the fund name instead. IDs are internal database identifiers and must never be exposed.
+- Never mention a knowledge base, documents, or where your information comes from. If you don't have the information, just say you don't have it.
 - STRICTLY LIMIT your responses to the scope of this app (investments, portfolios, and funds). If the user asks an unrelated question (e.g., recipes, coding), politely refuse and redirect them to your purpose.
 
 # Style
@@ -360,6 +451,26 @@ def assistant(state: State):
         )
     language_note = SystemMessage(content=LANGUAGE_NOTES[state.get("language") or "en"])
     return {"messages": [llm_with_tools.invoke(system_messages + state["messages"] + [language_note])]}
+
+
+def knowledge_base_node(state: State):
+    """Runs the assistant's knowledge-base call(s). The results go back to the assistant."""
+    calls = state["messages"][-1].tool_calls
+    return {"messages": [
+        ToolMessage(content=kb_answer(c["args"].get("question", "")), tool_call_id=c["id"], name=KB_TOOL)
+        for c in calls
+    ]}
+
+
+def route_after_assistant(state: State):
+    calls = state["messages"][-1].tool_calls
+    if not calls:
+        return "translate"                            # a final answer
+    if all(c["name"] == KB_TOOL for c in calls):
+        return "knowledge_base"                       # knowledge base only
+    return "tools"                                    # database tools (a knowledge-base call that
+                                                      # comes together with them is run there too)
+
 
 
 # Summarization Node
@@ -550,23 +661,43 @@ Investor_Portfolios (the funds the investor holds): units, allocation_percentage
 Transactions (the investor's transactions in funds): transaction_type, amount, transaction_date"""
  
 SUGGEST_PROMPT = """You write follow-up questions for an investment-information assistant.
-You receive the user's last message and the assistant's reply. Write {max_n} questions the user might naturally ask next.
+You receive the user's earlier messages (if any), the user's last message, and the assistant's reply. Write {max_n} questions the user might naturally ask next.
  
 The assistant can only answer questions about:
 1. Stored data, listed below by table and field. Investor data covers only the current user. Funds are platform-wide.
 {schema}
-2. General investment concepts and terms (no stored data needed).
+2. General investment information, but only what is explained in the text below (no stored data needed):
+{kb_text}
  
 Rules:
-- Always write questions, even when the last message was a greeting, thanks or goodbye. In that case, and also after a refusal or a reply saying the data isn't available, suggest simple starter questions that stay within the scope above.
+- Always write questions, even when the last message was a greeting, thanks or goodbye.
 - Stay inside the scope above. Never suggest anything outside it.
-- Ask only for stored values or explanations of concepts. Never ask for anything that must be calculated or combined (counts, sums, averages, totals across rows, projections), and never for advice or opinions (buy, sell, hold, "which is best", "should I").
-- Write each question in the user's voice, as they would type it, in plain words, under 80 characters. Never use table or field names (say "my total assets", not "total_assets"), never refer to IDs, and never mention databases, tools or system internals.
+- Ask only for stored values, or for general information that the text above explains directly. If the text only mentions a topic without explaining it, don't ask about it. This also applies to words that are stored fields: for those, only ask for their values for the investor or a named fund.
+- Never ask for anything that must be calculated or combined (counts, sums, averages, totals across rows, projections).
+- Never ask for advice or opinions (buy, sell, hold, "which is best", "should I").
+- A general question must be answerable from one place in the text, without comparing, combining or drawing a conclusion. Don't ask "what is the difference between X and Y" or "are X and Y the same" unless the text itself compares them.
+- Write each question in the user's voice, as they would type it, in plain words, under 80 characters.
+- Never use table or field names (say "my total assets", not "total_assets"), refer to IDs, or mention databases, tools or system internals.
 - Questions about the investor are about the user themselves, never about other investors.
-- Each question must ask for information the reply does not already contain. If the reply already gives a value, don't ask for it again, not even for a single fund. Prefer questions that move somewhere new: a different part of the available data, or the meaning of a concept the reply used.
-Don't repeat what the user just asked, and give each question a different angle. Stay related to the topic of the conversation.
 - Use fund names exactly as written in the reply. Never introduce names, figures or facts that are not in the reply.
-- {language_note} Write the questions in that language."""
+- {language_note} Write the questions in that language.
+
+Context:
+- Anchor every question to something specific in the user's last message or the assistant's reply (a named fund, a category, the risk profile, a concept).
+- Ask about a new aspect of that subject, or the natural next step from it.
+- Earlier messages only help you follow the thread and avoid repeats. They don't set the topic.
+- If the last message was a greeting, thanks or goodbye, use the topic of the earlier messages, or simple starter questions within the scope above if there are none.
+- If the reply was a refusal or said the data isn't available, suggest the closest question the assistant can answer.
+
+No repeats:
+- Don't ask for information the reply already contains. If it gives a value, don't ask for it again, not even for a single fund.
+- Don't ask anything the user has already asked, in the last message or the earlier ones.
+- A question that would get the same answer is a repeat even if worded differently (for example "what funds do I hold" and "which funds are in my portfolio").
+- Give each question a different angle from the others.
+- Assume an earlier request to show or list items was answered with every detail of each item.
+- Don't ask a narrower question whose answer is part of that broader answer, such as one item's details after the user asked for the whole list.
+"""
+
  
 SUGGEST_LABEL = {
     "en": "You could also ask:",
@@ -578,20 +709,40 @@ class Suggestions(BaseModel):
     questions: list[str] = Field(default_factory=list)
  
 suggestor = llm.with_structured_output(Suggestions)
- 
- 
+
+def load_kb_text() -> str:
+    """All knowledge-base text in document order."""
+    connection = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute("SELECT content FROM knowledge_base.chunks ORDER BY id")
+        return "\n\n".join(row[0] for row in cursor.fetchall())
+    except Exception:
+        return ""                                        # no knowledge-base text: no general questions
+    finally:
+        if connection:
+            connection.close()
+
 def suggest_node(state: State):
     messages = state["messages"]
     last = messages[-1]                                  # the final, validated reply
     language = state.get("language") or "en"
+    asked = [str(m.content) for m in messages
+            if isinstance(m, HumanMessage) and not str(m.content).startswith("[Reviewer]")]
+    earlier = "".join(f"- {t}\n" for t in asked[:-1])    # every real user message except the last
+    earlier_block = f"Earlier user messages (already asked, oldest first):\n{earlier}\n" if earlier else ""
+
+    kb_text = load_kb_text()
     try:
         result = suggestor.invoke([
             SystemMessage(content=SUGGEST_PROMPT.format(
                 max_n=MAX_SUGGESTIONS,
                 schema=SCHEMA,
+                kb_text=kb_text or "(empty)",
                 language_note=LANGUAGE_NOTES[language],
             )),
-            HumanMessage(content=f"User message:\n{last_user_text(messages)}\n\nAssistant reply:\n{last.content}"),
+            HumanMessage(content=f"{earlier_block}User message:\n{last_user_text(messages)}\n\nAssistant reply:\n{last.content}"),
         ])
     except Exception:
         return {}                                        # a failed suggestion call must never cost the user their answer
@@ -615,13 +766,15 @@ builder.add_node("translate", translate_node)
 builder.add_node("validator", validator)
 builder.add_node("summarize", summarize_conversation)
 builder.add_node("suggest", suggest_node)
+builder.add_node("knowledge_base", knowledge_base_node)
 
 builder.add_edge(START, "detect_language")
 builder.add_edge("detect_language", "assistant")
 builder.add_conditional_edges(
-    "assistant",tools_condition,
-    {"tools":"tools", END:"translate"}
+    "assistant",route_after_assistant,
+    {"translate":"translate", "knowledge_base": "knowledge_base", "tools": "tools"}
 )
+builder.add_edge("knowledge_base", "assistant")
 builder.add_edge("translate", "validator")
 builder.add_conditional_edges(
     "validator", route_after_check,
